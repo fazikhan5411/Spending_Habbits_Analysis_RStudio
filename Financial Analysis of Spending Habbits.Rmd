@@ -1,0 +1,225 @@
+---
+title: "Spending Habits"
+output: github_document
+---
+
+Since 2011 I have been keeping meticulous records of everything I spend money on. I really mean everything, including, for example, the 6 pence I spent on a 75g carrot which I bought at 7:47pm on the 2nd of August 2014 at Tesco Cowley Road Metro! There's a total of 1850 recipts for 4803 items covering a duration of 6 and a half years. The code to repoduce this analysis can be founnd in the [.Rmd](Finance.Rmd) file.
+
+```{r load_librarys, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+opts_chunk$set(echo=FALSE, fig.width=10, fig.asp=1/1.5, fig.retina=2, message=FALSE, warning=FALSE)
+library(data.table, quietly = TRUE)
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(scales)
+library(ggTimeSeries) #devtools::install_github('Ather-Energy/ggTimeSeries')
+library(googlesheets)
+library(ggrepel)
+library(ggforce)
+library(RColorBrewer)
+library(zoo) # for rollapply
+#library(plotly)
+```
+
+Looking at the distribution of item prices integer values (£1, £2 etc.) are more common, as well as 25p and 50p increments. I guess consumers prefer round numbers so companies size products accordingly (or just round up and take the difference as profit).
+
+```{r download, echo=FALSE}
+data_gs <- gs_title("Finance")
+data <- gs_read(data_gs, ws = "Undergrad Expenses")
+undergrad <- as.data.table(data)
+data <- gs_read(data_gs, ws = "DPhil Expenses")
+dphil <- as.data.table(data)
+
+Finance <- rbind(undergrad[, -c("Day","Notes"), with=FALSE], dphil[, -c("Totals:","X13"), with=FALSE])
+Finance <- Finance[!is.na(Item)] # remove empty lines
+
+#nrow(unique(Finance[,c("Date","Time")]))
+#round(as.numeric((max(Finance$Date, na.rm=T) - min(Finance$Date, na.rm=T))/365),1)
+
+# Reformat Date and Time
+Finance[, Date := dmy(Date)]
+Finance[, Year := as.factor(paste("Year",Year))]
+Finance[, Time := as.POSIXct(substr(Time, 0, 5), tz = "GMT", format = '%H:%M')]
+Finance[, Term := factor(Term, levels=c("Michaelmas","Christmas","Hilary","Trinity","Summer"))]
+Finance[, Category := as.factor(Category)]
+Finance[, Percentage := Price / sum(Price, na.rm = TRUE)]
+setorder(Finance, Date, Time)
+```
+
+```{r item-prices, fig.width=10}
+# Distribution of Item Prices
+ggplot(Finance, aes(Price)) +
+  geom_histogram(binwidth=0.02) +
+  scale_x_continuous(labels = dollar_format(prefix = "£"), limits=c(0,5)) +
+  labs(x="Price", y="Number of Items") +
+  theme_minimal()
+```
+
+Looking at the daily spend over time clearly shows the periods I was at university and the periods I was at home (with food etc. paid for by my parents) by the gaps where daily spending is £0. You can also see the peak in expenditure at the start of each month due to rent payments.
+
+```{r by-day, fig.width=10, fig.asp=1.2}
+# Aggregate: Price Per Day
+FinanceByDay <- Finance[,.(Spend = sum(Price, na.rm=T), Term=unique(Term)), by = Date]
+
+ggplot_calendar_heatmap(FinanceByDay[!is.na(Date)], 'Date', 'Spend') +
+  theme(legend.position = "bottom", legend.key.width=unit(3,"cm")) +
+  scale_fill_distiller(palette = 'YlOrRd', direction = 1, trans = "log10", breaks=c(1,5,10,50,100,500), labels = dollar_format(prefix = "£")) +
+  facet_wrap(~Year, ncol = 1)
+```
+
+There are also time of day patterns for example during the summer terms when I did internships I didn't buy anything between 9am and 5pm on weekdays because I was working. Aggregating over all years it seems my favourite shopping times are 1pm and 7pm (lunch and dinner!).
+
+```{r by-time, fig.width=10}
+# ggplot(Finance, aes(Date, Time, colour=Term, shape=weekdays(Date)%in%c("Saturday","Sunday"))) +
+#   geom_point() +
+#   scale_x_date(date_breaks = "1 year", date_minor_breaks="1 month", date_labels = "Start of %Y") +
+#   scale_y_datetime(date_breaks = "2 hours", date_labels = "%H:%M", minor_breaks = NULL, limits=as.POSIXct(c("7",NA),format = "%H")) +
+#   facet_wrap(~Year, scales = "free_x") +
+#   scale_shape_manual(values=c(16,1)) +
+#   scale_color_brewer(palette="Set1") +
+#   labs(shape="Weekend?") +
+#   theme_minimal() +
+#   theme(legend.position = "bottom")
+
+#  geom_vline(xintercept=as.numeric(ymd("2016-10-25"))) +
+#  geom_vline(xintercept=as.numeric(ymd("2016-09-08"))) +
+#  geom_vline(xintercept=as.numeric(ymd("2016-09-10"))) +
+#  facet_zoom(x = Date > ymd("2016-06-01") & Date < ymd("2016-12-01"))
+
+time_histogram <- hist(Finance[!is.na(Time)]$Time, breaks=72, plot=F)
+ggplot(data.table(Time=as_datetime(time_histogram$breaks), Density=time_histogram$density), aes(Time, Density)) +
+  geom_point() +
+  geom_smooth(span=0.25) +
+  scale_x_datetime(date_breaks = "2 hours", date_labels = "%H:%M", minor_breaks = NULL) +
+  theme_minimal()
+
+```
+
+My daily spending is nicely centered slightly below my target of 10k/year. The spike in spending in October 2016 is when I went to Vancouver.
+
+```{r rolling_mean, fig.asp=0.5}
+#FinanceByDay$Day <- as.numeric(FinanceByDay$Date - min(FinanceByDay$Date, na.rm = T))
+setkey(FinanceByDay, Date)
+FinanceByDayPadded <- FinanceByDay[J(seq(min(Date, na.rm = T), max(Date, na.rm = T),by=1))]
+FinanceByDayPadded[is.na(Spend),Spend:=0]
+FinanceByDayRolling <- FinanceByDayPadded[Date>as.Date("2015-10-1")][,.(Date, Daily_Spend=rollapply(Spend, 30, mean, align="right", fill=NA))]
+
+ggplot(FinanceByDayRolling[!is.na(Daily_Spend)], aes(Date, Daily_Spend)) +
+  geom_point(size=0.75) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %y") + 
+  scale_y_continuous(labels = dollar_format(prefix = "£"), limits=c(20,50)) +
+  labs(x="Date", y="Daily Spend (30 day average)") +
+  geom_hline(aes(colour="Target Maximum (£10K/year equiv.)", yintercept=10000/365), show.legend=TRUE) +
+  geom_hline(aes(colour="Overall Mean", yintercept=mean(FinanceByDayPadded[Date>as.Date("2015-10-1")]$Spend, na.rm=T)), show.legend=TRUE) +
+  scale_color_manual(values=c("blue","red"), name="") +
+  theme_minimal() +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 40, hjust = 1))
+
+```
+
+Breaking down my spending by category, Rent and bills account for 80% of my spending followed by Food at just over 10%.
+
+```{r by-category, fig.width=10}
+# Aggregate: Spend Per Categrory
+# FinanceByCategory <- Finance[,.(Spend = sum(Price, na.rm = T)),by=c("Category","Year")]
+
+setkey(Finance, Year, Category)
+FinanceByCategory <- Finance[CJ(unique(Year), unique(Category)), .(Spend = sum(Price, na.rm = T)), by = .EACHI] # need 0 counts
+
+FinanceByCategory <- FinanceByCategory[,.(Percentage = Spend/sum(Spend, na.rm = T), Category),by=Year]
+
+FinanceByCategory <- FinanceByCategory[!Category %in% c("Gymnastics","Laundry")]
+
+colour_scheme <- brewer.pal(9,"Paired")
+names(colour_scheme) <- as.character(unique(FinanceByCategory$Category))
+
+ggplot(FinanceByCategory, aes(Year, Percentage, colour=Category, group=Category)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::percent)+
+	labs(x="Year", y="Total Spend Per Category") +
+  theme_minimal() +
+  geom_label_repel(data = FinanceByCategory[Year == "Year 7" & Percentage>0.1],
+                   aes(label = Category),
+                   segment.color = "black",
+                   nudge_x = 1,
+                   na.rm = TRUE) +
+  scale_color_manual(values=colour_scheme, guide = FALSE)
+
+ggplot(FinanceByCategory[Percentage<0.1], aes(Year, Percentage, colour=Category, group=Category)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::percent, limits = c(0,0.09))+
+	labs(x="Year", y="Total Spend Per Category") +
+  theme_minimal() +
+  geom_label_repel(data = FinanceByCategory[Year == "Year 7" & Percentage<0.1],
+                   aes(label = Category),
+                   segment.color = "black",
+                   nudge_x = 1,
+                   na.rm = TRUE) +
+  scale_color_manual(values=colour_scheme, guide = FALSE)
+#scale_color_brewer(palette = "Paired",guide = FALSE) 
+```
+
+My most commonly bought items are milk, bananas and bread. 
+
+```{r by-item, fig.width=10}
+# Aggregate: Number of items
+FinanceByItem <- Finance[,.(Count = .N), by = Item][order(-Count)]
+FinanceByItem[,Item := factor(Item, levels=FinanceByItem[order(Count)]$Item)]
+
+ggplot(FinanceByItem[order(-Count)][1:10], aes(Item,Count)) +
+  geom_col() +
+  coord_flip() +
+	labs(x="", y="Total Number of Purchases") +
+  theme_minimal()
+```
+
+It's fun to see how my purchasing habits have changed over time.
+
+```{r by-item-by-time, fig.width=10}
+# Histogram Number of items
+setkey(Finance, Item, Year)
+FinanceByItem <- Finance[CJ(unique(Item), unique(Year)), .(Count = .N), by = .EACHI] # need 0 counts
+
+# numerous_items <- FinanceByItem[,sum(Count),by=Item][order(-V1)][1:20]$Item
+
+FinanceByItem[Item %in% c("Cottage Pie","Spaghetti Bolognase","Chicken Korma","Lloyd Grossman Bolognase Sauce"), Category := "Dinner"]
+FinanceByItem[Item %in% c("Bread Rolls","Kingsmill Wholemeal Rolls","Wholemeal Baps"), Category := "Bread"]
+FinanceByItem[Item %in% c("Milk Chocolate","Chocolate Cookies","Madeira Cake","Petits Filous"), Category := "Snacks"]
+FinanceByItem[Item %in% c("Muffins","Blueberry Muffins","Chocolate Muffins"), Category := "Muffins"]
+FinanceByItem[Item %in% c("Mild Cheddar Cheese","Medium Cheddar Cheese"), Category := "Cheese"]
+FinanceByItem[Item %in% c("Whole Wheat Pasta","Pasta"), Category := "Pasta"]
+
+#FinanceByItem[,Item := factor(Item, levels=unique(FinanceByItem[order(Count)]$Item))]
+#[Item %in% numerous_items]
+
+FinanceByItem <- FinanceByItem[!is.na(Category)]
+FinanceByItem[,Item := factor(Item, levels=unique(FinanceByItem[order(Category)]$Item))]
+
+ggplot(FinanceByItem[!is.na(Category)], aes(Year, Count, colour=Category, group=Item)) +
+  geom_line() +
+	labs(x="", y="Total Number of Purchases") +
+  theme_minimal()  + facet_wrap(~Item, scales = "free_y") + 
+  scale_color_manual(values = RColorBrewer::brewer.pal(9, "Set1")[c(1:5,9)]) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# to fix, banana(s), carrot(s), Potatoe(s), caps custard creams, Apple(s)
+# use fuzzy matching to find item names to correct
+#sapply(as.character(FinanceByItem$Item)[1:20], function(candidate_string) as.character(FinanceByItem$Item[agrepl(candidate_string, as.character(FinanceByItem$Item), max.distance = 0.2)]))
+
+# to do: change in habits (items, locations) over time
+
+```
+
+As I also recorded the weights I can calculate, for example, the average weight of a banana. Although I select large bananas to maximise banana to peel ratio so this is a biased sample.
+
+```{r bananas, fig.width=10, warning=FALSE}
+bananas <- Finance[Item=="Bananas"][,.(Weight=as.numeric(gsub("g","",Size)),Quantity, Date)][!is.na(Weight)][!is.na(Quantity)][Weight!=0]
+
+bananas <- bananas[!is.na(Weight)][!is.na(Quantity)][Weight!=0]
+bananas[,Weight := Weight/Quantity]
+
+qplot(rep(bananas$Weight, times=bananas$Quantity), geom="density") +
+  xlab("Banana Weight (grams)") + theme_minimal()
+```
+
